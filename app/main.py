@@ -19,7 +19,7 @@ from contextlib import asynccontextmanager
 
 from app.services.ai_handler import AIHandler
 from app.services.session_manager import SessionManager
-from app.services.ticket_service import TicketService
+from app.services.report_service import ReportService
 
 # Setup logging
 logging.basicConfig(
@@ -39,13 +39,13 @@ ENVIRONMENT = os.getenv("ENVIRONMENT", "development")
 # Initialize components on startup
 session_manager = None
 ai_handler = None
-ticket_service = None
+report_service = None
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Application lifespan manager"""
-    global session_manager, ai_handler, ticket_service
+    global session_manager, ai_handler, report_service
 
     # Startup
     logger.info("🚀 Starting ISP AI Support Service...")
@@ -53,7 +53,7 @@ async def lifespan(app: FastAPI):
 
     session_manager = SessionManager()
     ai_handler = AIHandler()
-    ticket_service = TicketService()
+    report_service = ReportService()
 
     logger.info("✅ All services initialized")
 
@@ -248,6 +248,25 @@ async def qiscus_webhook(request: Request):
             session=session,
         )
 
+        # Handle customer validation if needed
+        if ai_response.get("needs_validation"):
+            customer_ref_id = ai_response.get("customer_ref_id")
+            logger.info(f"🔍 Validating customer ID: {customer_ref_id}")
+            
+            validation_result = await report_service.validate_customer(customer_ref_id)
+            
+            # Update session with validation result
+            ai_response["session"]["collected_data"]["customer_validated"] = validation_result.get("valid")
+            ai_response["session"]["collected_data"]["customer_data"] = validation_result.get("customer_data")
+            
+            # Process again to get the appropriate response
+            ai_response = await ai_handler.process_message(
+                customer_id=customer_id,
+                customer_name=customer_name,
+                message="",  # Empty message, just processing validation result
+                session=ai_response["session"],
+            )
+
         # Update session
         session_manager.update_session(
             customer_id=customer_id, session_data=ai_response["session"]
@@ -257,16 +276,25 @@ async def qiscus_webhook(request: Request):
         logger.info(f"🤖 AI Reply: {ai_response['reply'][:100]}...")
         logger.info(f"📊 State: {ai_response['session']['state']}")
 
-        # If ticket created, save to ticketing system
-        if ai_response.get("ticket_created"):
-            ticket_data = ai_response.get("ticket_data")
-            ticket_result = await ticket_service.create_ticket(ticket_data)
+        # If report needs to be created, send to incoming reports API
+        if ai_response.get("report_created"):
+            report_data = ai_response.get("report_data")
+            report_result = await report_service.create_report(
+                customer_id=report_data.get("customer_id"),
+                customer_site_id=report_data.get("customer_site_id"),
+                customer_name=report_data.get("customer_name"),
+                customer_phone=report_data.get("customer_phone"),
+                description=report_data.get("description"),
+                customer_references_number=report_data.get("customer_references_number"),
+                problem_time=report_data.get("problem_time"),
+                qiscus_session_id=report_data.get("qiscus_session_id")
+            )
 
-            if ticket_result.get("success"):
-                logger.info(f"🎫 Ticket created: {ticket_result.get('ticket_id')}")
+            if report_result.get("success"):
+                logger.info(f"📋 Incoming report created: {report_result.get('data', {}).get('id')}")
             else:
                 logger.error(
-                    f"❌ Failed to create ticket: {ticket_result.get('error')}"
+                    f"❌ Failed to create report: {report_result.get('error')}"
                 )
 
         # Send response back to Qiscus
@@ -281,7 +309,7 @@ async def qiscus_webhook(request: Request):
             "room_id": room_id,
             "message_sent": send_success,
             "state": ai_response["session"]["state"],
-            "ticket_created": ai_response.get("ticket_created", False),
+            "report_created": ai_response.get("report_created", False),
         }
 
         return JSONResponse(status_code=200, content=response_data)
@@ -346,16 +374,54 @@ async def test_message(
         session=session,
     )
 
+    # Handle customer validation if needed
+    validation_result = None
+    if ai_response.get("needs_validation"):
+        customer_ref_id = ai_response.get("customer_ref_id")
+        logger.info(f"🔍 Validating customer ID: {customer_ref_id}")
+        
+        validation_result = await report_service.validate_customer(customer_ref_id)
+        
+        # Update session with validation result
+        ai_response["session"]["collected_data"]["customer_validated"] = validation_result.get("valid")
+        ai_response["session"]["collected_data"]["customer_data"] = validation_result.get("customer_data")
+        
+        # Process again to get the appropriate response
+        ai_response = await ai_handler.process_message(
+            customer_id=customer_id,
+            customer_name=customer_name,
+            message="",  # Empty message, just processing validation result
+            session=ai_response["session"],
+        )
+
     session_manager.update_session(
         customer_id=customer_id, session_data=ai_response["session"]
     )
+
+    # If report needs to be created, send to incoming reports API
+    report_result = None
+    if ai_response.get("report_created"):
+        report_data = ai_response.get("report_data")
+        report_result = await report_service.create_report(
+            customer_id=report_data.get("customer_id"),
+            customer_site_id=report_data.get("customer_site_id"),
+            customer_name=report_data.get("customer_name"),
+            customer_phone=report_data.get("customer_phone"),
+            description=report_data.get("description"),
+            customer_references_number=report_data.get("customer_references_number"),
+            problem_time=report_data.get("problem_time"),
+            qiscus_session_id=report_data.get("qiscus_session_id")
+        )
+        logger.info(f"📋 Report result: {report_result}")
 
     return {
         "reply": ai_response["reply"],
         "state": ai_response["session"]["state"],
         "collected_data": ai_response["session"].get("collected_data"),
-        "ticket_created": ai_response.get("ticket_created", False),
-        "ticket_data": ai_response.get("ticket_data"),
+        "validation_result": validation_result,
+        "report_created": ai_response.get("report_created", False),
+        "report_data": ai_response.get("report_data"),
+        "report_result": report_result,
     }
 
 
