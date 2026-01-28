@@ -3,7 +3,7 @@
 # Test script untuk ISP AI Support
 # Usage: ./test.sh
 
-BASE_URL="http://localhost:8001"
+BASE_URL="http://localhost:8000"
 CUSTOMER_ID="628115987778"
 CUSTOMER_NAME="Vincent"
 

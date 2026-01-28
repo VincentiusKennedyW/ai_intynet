@@ -51,7 +51,7 @@ services:
       resources:
         limits:
           memory: 1G
-    command: gunicorn main:app --workers 2 --worker-class uvicorn.workers.UvicornWorker --bind 0.0.0.0:8000 --access-logfile /app/logs/access.log --error-logfile /app/logs/error.log
+    command: gunicorn app.main:app --workers 2 --worker-class uvicorn.workers.UvicornWorker --bind 0.0.0.0:8000 --access-logfile /app/logs/access.log --error-logfile /app/logs/error.log
 
   # Nginx reverse proxy (optional but recommended)
   nginx:

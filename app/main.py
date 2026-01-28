@@ -17,9 +17,9 @@ import httpx
 import logging
 from contextlib import asynccontextmanager
 
-from ai_handler import AIHandler
-from session_manager import SessionManager
-from ticket_service import TicketService
+from app.services.ai_handler import AIHandler
+from app.services.session_manager import SessionManager
+from app.services.ticket_service import TicketService
 
 # Setup logging
 logging.basicConfig(
