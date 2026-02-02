@@ -384,16 +384,17 @@ Max 2 kalimat."""
             next_state = self.STATE_COMPLETED
             collected_data["resolved_by_troubleshooting"] = True
         else:
-            # Need to create report - Show FORM
-            form_text = """Baik, saya akan bantu buatkan laporan ke tim teknis kami.
+            # Need to create report - Show FORM (copy-paste ready)
+            form_text = """Baik, saya akan bantu buatkan laporan ke tim teknis kami. 📝
 
-Mohon isi data berikut:Ï
-• *ID Pelanggan*: (contoh: C650AD - bisa dilihat di tagihan)
-• *Detail Gangguan*: (jelaskan masalahnya, sejak kapan, kondisi modem)
+Mohon *copy-paste* format di bawah ini, lalu isi datanya:
 
-Silakan balas dengan format:
-ID: [nomor ID]
-Gangguan: [detail masalah]"""
+ID: 
+Gangguan: 
+
+Contoh pengisian:
+ID: C650AD
+Gangguan: Internet mati sejak pagi, lampu modem merah berkedip"""
 
             reply = form_text
             next_state = self.STATE_COLLECT_FORM
@@ -440,13 +441,14 @@ Gangguan: [detail masalah]"""
 
         # Validate we have both
         if not extracted_id:
-            reply = """Maaf, saya tidak menemukan ID Pelanggan di pesan kamu.
+            reply = """Hmm, saya tidak menemukan ID Pelanggan di pesanmu 🤔
 
-Mohon isi ulang dengan format:
-• *ID Pelanggan*: (contoh: C650AD)
-• *Detail Gangguan*: (jelaskan masalahnya)
+Coba *copy-paste* format ini ya:
 
-Contoh: "ID: C650AD, Gangguan: Internet mati sejak pagi, lampu modem merah" """
+ID: 
+Gangguan: 
+
+*(ID bisa dilihat di tagihan/kontrak, contoh: C650AD)*"""
 
             return {
                 "reply": reply,
@@ -457,14 +459,11 @@ Contoh: "ID: C650AD, Gangguan: Internet mati sejak pagi, lampu modem merah" """
             }
 
         if not extracted_desc or len(extracted_desc) < 5:
-            reply = f"""ID Pelanggan: {extracted_id} ✓
+            reply = f"""✅ ID Pelanggan: *{extracted_id}*
 
-Tapi detail gangguannya belum lengkap. Mohon jelaskan:
-• Masalahnya apa?
-• Sejak kapan?
-• Kondisi lampu modem?
+Tapi detail gangguannya belum ada. Balas dengan:
 
-Balas dengan format: Gangguan: [detail masalah]"""
+Gangguan: [jelaskan masalahnya, sejak kapan]"""
 
             collected_data["customer_references_number"] = extracted_id
 
