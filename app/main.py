@@ -1,226 +1,267 @@
 """
-ISP Customer Support AI Service - PRODUCTION VERSION
-Handles Qiscus webhook, conversational AI, and ticket creation
+ISP AI Customer Support - Production Ready
+==========================================
+Handles: Product inquiries, Complaint troubleshooting
+Features: Message buffering, Session management, Qiscus integration
 """
+
+import json
+import os
+import logging
+from datetime import datetime
+from contextlib import asynccontextmanager
+from typing import Dict, Any
 
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
-from typing import Optional, Dict, Any, List
-import json
-import hmac
-import hashlib
-from datetime import datetime
-import os
-import httpx
-import logging
-from contextlib import asynccontextmanager
 
 from app.services.ai_handler import AIHandler
 from app.services.session_manager import SessionManager
-from app.services.report_service import ReportService
+from app.services.message_buffer import MessageBuffer
+from app.services.qiscus_service import QiscusService
 
-# Setup logging
+# ============ LOGGING ============
+
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
 )
 logger = logging.getLogger(__name__)
 
-# Configuration
-QISCUS_SECRET = os.getenv("QISCUS_SECRET", "")
-QISCUS_APP_ID = os.getenv("QISCUS_APP_ID", "")
-QISCUS_SECRET_KEY = os.getenv("QISCUS_SECRET_KEY", "")
-QISCUS_API_URL = os.getenv(
-    "QISCUS_SEND_MESSAGE_URL", "https://multichannel.qiscus.com/api/v1"
-)
-ENVIRONMENT = os.getenv("ENVIRONMENT", "development")
+# ============ CONFIGURATION ============
 
-# Initialize components on startup
-session_manager = None
-ai_handler = None
-report_service = None
+ENVIRONMENT = os.getenv("ENVIRONMENT", "development")
+MESSAGE_BUFFER_DELAY = float(os.getenv("MESSAGE_BUFFER_DELAY", "10.0")) 
+
+# ============ COMPONENTS ============
+
+session_manager: SessionManager = None
+ai_handler: AIHandler = None
+message_buffer: MessageBuffer = None
+qiscus_service: QiscusService = None
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Application lifespan manager"""
-    global session_manager, ai_handler, report_service
+    """Initialize and cleanup resources"""
+    global session_manager, ai_handler, message_buffer, qiscus_service
 
-    # Startup
     logger.info("🚀 Starting ISP AI Support Service...")
-    logger.info(f"📍 Environment: {ENVIRONMENT}")
 
+    # Initialize components
     session_manager = SessionManager()
     ai_handler = AIHandler()
-    report_service = ReportService()
+    message_buffer = MessageBuffer(delay_seconds=MESSAGE_BUFFER_DELAY)
+    qiscus_service = QiscusService()
 
-    logger.info("✅ All services initialized")
+    # Health check
+    redis_ok = session_manager.check_health()
+    logger.info(
+        f"{'✅' if redis_ok else '⚠️'} Redis: {'connected' if redis_ok else 'using memory fallback'}"
+    )
+    logger.info(f"✅ Environment: {ENVIRONMENT}")
+    logger.info(f"✅ Buffer delay: {MESSAGE_BUFFER_DELAY}s")
 
     yield
 
-    # Shutdown
-    logger.info("🛑 Shutting down ISP AI Support Service...")
+    logger.info("👋 Shutting down...")
 
+
+# ============ APP ============
 
 app = FastAPI(
     title="ISP AI Support",
     version="2.0.0",
-    description="Production-ready AI customer support system",
+    description="AI-powered customer support for Intynet ISP",
     lifespan=lifespan,
 )
 
-# CORS middleware
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Adjust for production
-    allow_credentials=True,
+    allow_origins=["*"],
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
 
-# def verify_qiscus_signature(signature: str, body: bytes) -> bool:
-#     """Verify Qiscus webhook signature"""
-#     if ENVIRONMENT == "development" and not QISCUS_SECRET:
-#         logger.warning("⚠️ Signature verification SKIPPED (development mode)")
-#         return True
+# ============ HELPER FUNCTIONS ============
 
-#     if not QISCUS_SECRET:
-#         logger.error("❌ QISCUS_SECRET not configured")
-#         return False
-
-#     computed = hmac.new(
-#         QISCUS_SECRET.encode(),
-#         body,
-#         hashlib.sha256
-#     ).hexdigest()
-
-#     is_valid = hmac.compare_digest(signature, computed)
-
-#     if not is_valid:
-#         logger.warning(f"⚠️ Invalid signature received")
-
-#     return is_valid
-
-
-async def send_qiscus_message(room_id: str, message: str, customer_id: str) -> bool:
-    """Send message back to Qiscus room"""
-
-    if not QISCUS_APP_ID or not QISCUS_SECRET_KEY:
-        logger.warning(f"⚠️ Qiscus API credentials not configured")
-        logger.info(f"   Would send to room {room_id}: {message[:100]}...")
-        return False
-
-    url = f"{QISCUS_API_URL}"
-
-    headers = {
-        "Qiscus-App-Id": QISCUS_APP_ID,
-        "Qiscus-Secret-Key": QISCUS_SECRET_KEY,
-        "Content-Type": "application/json",
-    }
-
-    payload = {
-        "to": customer_id,
-        "type": "text",
-        "text": {"body": message},
-        "room_id": room_id,
-    }
-
-    try:
-        async with httpx.AsyncClient(timeout=15.0) as client:
-            response = await client.post(url, headers=headers, json=payload)
-            response.raise_for_status()
-
-            logger.info(f"✅ Message sent to Qiscus room {room_id}")
+def is_complaint_or_report_related(message: str) -> bool:
+    """Check if message is related to complaint/report"""
+    msg = message.lower()
+    
+    # Complaint/issue keywords - comprehensive list
+    complaint_keywords = [
+        # Status & progress
+        "laporan", "gimana", "bagaimana", "sudah", "udah", "belum", 
+        "progress", "status", "proses", "ditangani", "kapan",
+        # Internet issues  
+        "gangguan", "mati", "lambat", "putus", "tidak bisa", "gak bisa",
+        "ga bisa", "gabisa", "gk bisa", "error", "masalah", "kendala",
+        "trouble", "down", "lelet", "lemot", "lag", "disconnect",
+        "los", "merah", "rusak", "wifi", "internet", "koneksi",
+        # Expressions of frustration
+        "masih", "tetap", "tetep", "sama aja", "gk usah", "juga"
+    ]
+    
+    # Check for any complaint keyword
+    for kw in complaint_keywords:
+        if kw in msg:
             return True
+    
+    return False
 
-    except httpx.HTTPStatusError as e:
-        logger.error(
-            f"❌ Qiscus API Error: {e.response.status_code} - {e.response.text}"
+
+def is_acknowledgment(message: str) -> bool:
+    """Check if message is just an acknowledgment (ok, baik, siap, etc)"""
+    ack_responses = [
+        "ok", "oke", "okey", "okay", "baik", "baiklah", "siap", "sip", 
+        "iya", "ya", "yaa", "yup", "yep", "thanks", "makasih", "terima kasih",
+        "noted", "good", "mantap", "aman", "done", "sudah", "udah"
+    ]
+    message_clean = message.lower().strip().rstrip(".!,")
+    
+    # Check if message is short acknowledgment
+    if message_clean in ack_responses:
+        return True
+    
+    # Check if starts with ack and is short
+    words = message_clean.split()
+    if len(words) <= 3 and words[0] in ack_responses:
+        return True
+    
+    return False
+
+
+# ============ MESSAGE PROCESSOR ============
+
+async def process_buffered_message(
+    customer_id: str, message: str, metadata: Dict[str, Any]
+):
+    """Process combined messages after buffer delay"""
+    customer_name = metadata.get("customer_name", "Customer")
+    room_id = metadata.get("room_id")
+
+    logger.info(f"🤖 Processing: '{message[:50]}...' from {customer_name}")
+
+    # Get session
+    session = session_manager.get_session(customer_id)
+
+    # Handle acknowledgment messages (ok, baik, siap, etc)
+    if is_acknowledgment(message):
+        logger.info("👍 Acknowledgment message - sending simple response")
+        if room_id:
+            await qiscus_service.send_message(
+                room_id=room_id,
+                message="Siap kak!",
+                customer_id=customer_id,
+            )
+        return
+
+    # ===== CHECK TAG STATUS FIRST =====
+    has_tag = False
+    is_expired = False
+    tag_id = None
+    
+    if room_id:
+        has_tag, is_expired, tag_id = await qiscus_service.check_escalated_tag(room_id)
+        logger.info(f"🏷️ Tag check: has_tag={has_tag}, is_expired={is_expired}")
+
+    # If tag expired (> 2 days), auto-remove and allow conversation
+    if has_tag and is_expired and tag_id:
+        logger.info("⏰ Tag expired (admin forgot) → auto-removing tag")
+        await qiscus_service.remove_room_tag(room_id, tag_id)
+        has_tag = False
+        session = {"state": "detect", "message_count": 0}
+        session_manager.update_session(customer_id, session)
+
+    # ===== INTERCEPT IF HAS PENDING REPORT =====
+    # If has tag (not expired), ANY complaint-related message gets intercepted
+    if has_tag and not is_expired:
+        # Check if message is about the pending report
+        is_report_related = is_complaint_or_report_related(message)
+        logger.info(f"📋 Has pending report. Message related to report: {is_report_related}")
+        
+        if is_report_related:
+            logger.info("🚫 Intercepting - sending pending status")
+            await qiscus_service.send_message(
+                room_id=room_id,
+                message="Halo kak! 👋\n\nLaporan kakak masih dalam proses penanganan oleh tim teknis kami. Mohon ditunggu ya kak, tim kami akan segera menghubungi kakak untuk tindak lanjut.\n\nTerima kasih atas kesabarannya 🙏",
+                customer_id=customer_id,
+            )
+            return
+        else:
+            # Non-complaint topic allowed, but mark session
+            logger.info("📋 Non-complaint topic - allowing AI to respond")
+            if "collected_data" not in session:
+                session["collected_data"] = {}
+            session["collected_data"]["has_pending_report"] = True
+
+    # If no pending report and session was escalated → reset completely
+    if not has_tag and session.get("state") == "escalated":
+        logger.info("✅ Tag removed by admin → resetting session")
+        session = {"state": "detect", "message_count": 0}
+        session_manager.update_session(customer_id, session)
+
+    # Process with AI
+    ai_response = await ai_handler.process_message(
+        customer_id=customer_id,
+        customer_name=customer_name,
+        message=message,
+        session=session,
+    )
+
+    new_session = ai_response["session"]
+
+    # If escalated (form submitted), add tag
+    if ai_response.get("ai_stop"):
+        logger.info("🛑 AI STOP - Escalated to human agent")
+
+        if room_id:
+            await qiscus_service.mark_ai_escalated(room_id)
+
+        session_manager.update_session(customer_id, new_session)
+        return
+
+    session_manager.update_session(customer_id, new_session)
+
+    # Send reply
+    if room_id and ai_response.get("reply"):
+        await qiscus_service.send_message(
+            room_id=room_id, message=ai_response["reply"], customer_id=customer_id
         )
-        return False
-
-    except Exception as e:
-        logger.error(f"❌ Failed to send to Qiscus: {e}")
-        return False
 
 
-@app.get("/")
-async def root():
-    """Root endpoint"""
-    return {
-        "service": "ISP AI Support",
-        "version": "2.0.0",
-        "status": "running",
-        "environment": ENVIRONMENT,
-        "timestamp": datetime.now().isoformat(),
-    }
-
-
-@app.get("/health")
-async def health():
-    """Detailed health check"""
-    redis_status = session_manager.check_health() if session_manager else False
-
-    qiscus_configured = bool(QISCUS_APP_ID and QISCUS_SECRET_KEY)
-
-    return {
-        "status": "healthy" if redis_status else "degraded",
-        "components": {
-            "api": "ok",
-            "redis": "ok" if redis_status else "error",
-            "ai": "ok",
-            "qiscus": "configured" if qiscus_configured else "not_configured",
-        },
-        "environment": ENVIRONMENT,
-        "timestamp": datetime.now().isoformat(),
-    }
+# ============ WEBHOOK ENDPOINT ============
 
 
 @app.post("/webhook/qiscus")
 async def qiscus_webhook(request: Request):
     """
-    Main webhook endpoint for Qiscus messages
-    Receives customer messages and processes with AI
+    Handle incoming Qiscus webhook.
+    Messages are buffered to handle multiple bubbles.
     """
     try:
-        # Get raw body
         body = await request.body()
-
-        # Verify signature
-        signature = request.headers.get("qiscus-signature-key", "")
-
-        # if ENVIRONMENT == "production":
-        #     if not verify_qiscus_signature(signature, body):
-        #         raise HTTPException(status_code=401, detail="Invalid signature")
-        # else:
-        #     logger.warning("⚠️ Signature verification skipped (development mode)")
-
-        # Parse payload
         data = json.loads(body)
 
         # Handle array payload
         if isinstance(data, list) and len(data) > 0:
             data = data[0]
 
-        # Extract message data - handle both structures
-        if "body" in data:
+        # Extract payload
+        payload = data.get("payload", {})
+        if not payload:
             payload = data.get("body", {}).get("payload", {})
-        else:
-            payload = data.get("payload", {})
 
         if not payload:
-            logger.warning("⚠️ No payload found in webhook")
-            return JSONResponse(
-                status_code=200, content={"status": "ignored", "reason": "no payload"}
-            )
+            return JSONResponse({"status": "ignored", "reason": "no_payload"})
 
-        message_data = payload.get("message", {})
+        # Extract message info
         from_data = payload.get("from", {})
         room_data = payload.get("room", {})
+        message_data = payload.get("message", {})
 
-        # Extract key information
         customer_id = from_data.get("email", "")
         customer_name = from_data.get("name", "Customer")
         message_text = message_data.get("text", "")
@@ -229,143 +270,118 @@ async def qiscus_webhook(request: Request):
 
         # Only process text messages
         if message_type != "text" or not message_text:
-            return JSONResponse(
-                status_code=200,
-                content={"status": "ignored", "reason": "non-text message"},
-            )
+            return JSONResponse({"status": "ignored", "reason": "non_text"})
 
-        # Log incoming message
-        logger.info(f"📨 Message from {customer_name} ({customer_id}): {message_text}")
+        logger.info(f"📨 From {customer_name} ({customer_id}): {message_text[:50]}...")
 
-        # Get or create session
-        session = session_manager.get_session(customer_id)
-
-        # Process with AI
-        ai_response = await ai_handler.process_message(
+        # Add to buffer
+        pending = await message_buffer.add_message(
             customer_id=customer_id,
-            customer_name=customer_name,
             message=message_text,
-            session=session,
+            metadata={
+                "customer_name": customer_name,
+                "room_id": room_id,
+            },
+            process_callback=process_buffered_message,
         )
 
-        # Handle customer validation if needed
-        if ai_response.get("needs_validation"):
-            customer_ref_id = ai_response.get("customer_ref_id")
-            logger.info(f"🔍 Validating customer ID: {customer_ref_id}")
-            
-            validation_result = await report_service.validate_customer(customer_ref_id)
-            
-            # Update session with validation result
-            ai_response["session"]["collected_data"]["customer_validated"] = validation_result.get("valid")
-            ai_response["session"]["collected_data"]["customer_data"] = validation_result.get("customer_data")
-            
-            # Process again to get the appropriate response
-            ai_response = await ai_handler.process_message(
-                customer_id=customer_id,
-                customer_name=customer_name,
-                message="",  # Empty message, just processing validation result
-                session=ai_response["session"],
-            )
+        logger.info(f"📝 Buffered ({pending} pending)")
 
-        # Update session
-        session_manager.update_session(
-            customer_id=customer_id, session_data=ai_response["session"]
-        )
-
-        # Log AI response
-        logger.info(f"🤖 AI Reply: {ai_response['reply'][:100]}...")
-        logger.info(f"📊 State: {ai_response['session']['state']}")
-
-        # If report needs to be created, send to incoming reports API
-        if ai_response.get("report_created"):
-            report_data = ai_response.get("report_data")
-            report_result = await report_service.create_report(
-                customer_id=report_data.get("customer_id"),
-                customer_site_id=report_data.get("customer_site_id"),
-                customer_name=report_data.get("customer_name"),
-                customer_phone=report_data.get("customer_phone"),
-                description=report_data.get("description"),
-                customer_references_number=report_data.get("customer_references_number"),
-                problem_time=report_data.get("problem_time"),
-                qiscus_session_id=report_data.get("qiscus_session_id")
-            )
-
-            if report_result.get("success"):
-                logger.info(f"📋 Incoming report created: {report_result.get('data', {}).get('id')}")
-            else:
-                logger.error(
-                    f"❌ Failed to create report: {report_result.get('error')}"
-                )
-
-        # Send response back to Qiscus
-        send_success = await send_qiscus_message(
-            room_id, ai_response["reply"], customer_id
-        )
-
-        # Prepare response
-        response_data = {
-            "status": "success",
-            "customer_id": customer_id,
-            "room_id": room_id,
-            "message_sent": send_success,
-            "state": ai_response["session"]["state"],
-            "report_created": ai_response.get("report_created", False),
-        }
-
-        return JSONResponse(status_code=200, content=response_data)
-
-    except HTTPException:
-        raise
+        return JSONResponse({"status": "buffered", "pending_messages": pending})
 
     except Exception as e:
-        logger.error(f"❌ Error processing webhook: {str(e)}", exc_info=True)
-
+        logger.error(f"❌ Webhook error: {e}", exc_info=True)
         return JSONResponse(
-            status_code=200,  # Return 200 to avoid Qiscus retries
-            content={"status": "error", "message": "Internal processing error"},
+            status_code=200,  # Return 200 to prevent Qiscus retries
+            content={"status": "error", "message": str(e)},
         )
+
+
+# ============ API ENDPOINTS ============
+
+
+@app.get("/health")
+async def health():
+    """Health check"""
+    return {
+        "status": "healthy",
+        "redis": "connected" if session_manager.check_health() else "memory",
+        "environment": ENVIRONMENT,
+    }
+
+
+@app.get("/stats")
+async def stats():
+    """System statistics"""
+    session_stats = session_manager.get_stats()
+    return {
+        "sessions": session_stats,
+        "buffer": {
+            "delay_seconds": message_buffer.delay,
+            "active_buffers": len(message_buffer.buffers),
+        },
+        "timestamp": datetime.now().isoformat(),
+    }
 
 
 @app.get("/sessions")
-async def list_sessions():
-    """List all active sessions (admin only)"""
-    sessions = session_manager.get_all_sessions()
-    return {
-        "count": len(sessions),
-        "sessions": sessions,
-        "timestamp": datetime.now().isoformat(),
-    }
+async def get_sessions():
+    """Get all active sessions"""
+    return session_manager.get_all_sessions()
 
 
 @app.get("/session/{customer_id}")
 async def get_session(customer_id: str):
-    """Get session data for a customer"""
-    session = session_manager.get_session(customer_id)
-    return {
-        "customer_id": customer_id,
-        "session": session,
-        "timestamp": datetime.now().isoformat(),
-    }
+    """Get session for a customer"""
+    return session_manager.get_session(customer_id)
 
 
 @app.delete("/session/{customer_id}")
-async def reset_session(customer_id: str):
-    """Reset session for a customer"""
-    session_manager.delete_session(customer_id)
-    logger.info(f"🔄 Session reset for {customer_id}")
-    return {
-        "status": "success",
-        "message": f"Session reset for {customer_id}",
-        "timestamp": datetime.now().isoformat(),
-    }
+async def delete_session(customer_id: str):
+    """Reset customer session"""
+    message_buffer.clear(customer_id)
+    success = session_manager.delete_session(customer_id)
+    return {"status": "deleted" if success else "not_found"}
 
 
-@app.post("/test/message")
-async def test_message(
-    customer_id: str, message: str, customer_name: str = "Test Customer"
+# ============ TEST ENDPOINTS ============
+
+
+@app.post("/test/chat")
+async def test_chat(
+    customer_id: str, 
+    message: str, 
+    customer_name: str = "Test Customer",
+    room_id: str = None
 ):
-    """Test endpoint to simulate messages without Qiscus"""
+    """
+    Test endpoint - direct processing without buffer.
+    Provide room_id to test tag-based logic.
+    """
     session = session_manager.get_session(customer_id)
+
+    # Check if room has escalated tag (if room_id provided)
+    has_pending_report = False
+    if room_id:
+        has_pending_report = await qiscus_service.has_escalated_tag(room_id)
+
+    # If has pending report and asking about complaint → reply pending
+    if has_pending_report and is_complaint_topic(message):
+        return {
+            "reply": "Laporan kakak masih dalam proses penanganan oleh tim teknis kami. Mohon ditunggu ya kak 🙏",
+            "state": "escalated",
+            "ai_stop": True,
+            "has_pending_report": True,
+        }
+
+    # If has pending report but asking other topic → allow conversation
+    if has_pending_report and session.get("state") == "escalated":
+        session["state"] = "detect"
+
+    # If no pending report and session was escalated → reset
+    if not has_pending_report and session.get("state") == "escalated":
+        session = {"state": "detect", "message_count": 0}
+        session_manager.update_session(customer_id, session)
 
     ai_response = await ai_handler.process_message(
         customer_id=customer_id,
@@ -374,79 +390,38 @@ async def test_message(
         session=session,
     )
 
-    # Handle customer validation if needed
-    validation_result = None
-    if ai_response.get("needs_validation"):
-        customer_ref_id = ai_response.get("customer_ref_id")
-        logger.info(f"🔍 Validating customer ID: {customer_ref_id}")
-        
-        validation_result = await report_service.validate_customer(customer_ref_id)
-        
-        # Update session with validation result
-        ai_response["session"]["collected_data"]["customer_validated"] = validation_result.get("valid")
-        ai_response["session"]["collected_data"]["customer_data"] = validation_result.get("customer_data")
-        
-        # Process again to get the appropriate response
-        ai_response = await ai_handler.process_message(
-            customer_id=customer_id,
-            customer_name=customer_name,
-            message="",  # Empty message, just processing validation result
-            session=ai_response["session"],
-        )
+    new_session = ai_response["session"]
 
-    session_manager.update_session(
-        customer_id=customer_id, session_data=ai_response["session"]
-    )
+    # If escalated, add tag (if room_id provided)
+    if ai_response.get("ai_stop"):
+        logger.info("🛑 AI STOP - Form submitted")
+        if room_id:
+            await qiscus_service.mark_ai_escalated(room_id)
 
-    # If report needs to be created, send to incoming reports API
-    report_result = None
-    if ai_response.get("report_created"):
-        report_data = ai_response.get("report_data")
-        report_result = await report_service.create_report(
-            customer_id=report_data.get("customer_id"),
-            customer_site_id=report_data.get("customer_site_id"),
-            customer_name=report_data.get("customer_name"),
-            customer_phone=report_data.get("customer_phone"),
-            description=report_data.get("description"),
-            customer_references_number=report_data.get("customer_references_number"),
-            problem_time=report_data.get("problem_time"),
-            qiscus_session_id=report_data.get("qiscus_session_id")
-        )
-        logger.info(f"📋 Report result: {report_result}")
+    session_manager.update_session(customer_id, new_session)
 
     return {
-        "reply": ai_response["reply"],
-        "state": ai_response["session"]["state"],
-        "collected_data": ai_response["session"].get("collected_data"),
-        "validation_result": validation_result,
-        "report_created": ai_response.get("report_created", False),
-        "report_data": ai_response.get("report_data"),
-        "report_result": report_result,
+        "reply": ai_response.get("reply"),
+        "state": new_session["state"],
+        "ai_stop": ai_response.get("ai_stop", False),
+        "has_pending_report": has_pending_report,
     }
 
 
-@app.get("/stats")
-async def get_stats():
-    """Get system statistics"""
-    sessions = session_manager.get_all_sessions()
-
-    # Calculate stats
-    total_sessions = len(sessions)
-    states_count = {}
-
-    for customer_id, session in sessions.items():
-        state = session.get("state", "unknown")
-        states_count[state] = states_count.get(state, 0) + 1
-
+@app.get("/test/check-tag/{room_id}")
+async def test_check_tag(room_id: str):
+    """Test checking if room has escalated tag"""
+    has_tag = await qiscus_service.has_escalated_tag(room_id)
+    tags = await qiscus_service.get_room_tags(room_id)
     return {
-        "total_active_sessions": total_sessions,
-        "states_distribution": states_count,
-        "environment": ENVIRONMENT,
-        "timestamp": datetime.now().isoformat(),
+        "room_id": room_id,
+        "has_escalated_tag": has_tag,
+        "all_tags": tags,
     }
 
 
-if __name__ == "__main__":
-    import uvicorn
-
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+@app.post("/test/add-tag/{room_id}")
+async def test_add_tag(room_id: str):
+    """Test adding escalated tag to room"""
+    success = await qiscus_service.mark_ai_escalated(room_id)
+    return {"success": success, "room_id": room_id}

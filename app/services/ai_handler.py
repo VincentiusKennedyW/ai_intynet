@@ -1,231 +1,445 @@
 """
-AI Handler - Troubleshooting First, Then Report with Customer Validation
-Flow: Greeting → Troubleshooting → Check Resolved → Show Form → Validate Customer → Confirm → Submit Report
+AI Handler - Intynet Customer Service Bot
+==========================================
+Smart state machine with AI-based intent detection.
+NO keyword matching - uses LLM to classify intent dynamically.
+
+State Flow (LOCKED SEQUENCE):
+    DETECT → PRODUCT_INFO | TROUBLESHOOT
+    TROUBLESHOOT → FORM_SENT → ESCALATED
+    
+Any state can transition back to DETECT for new topics.
+
+Author: Intynet Team
+Version: 3.0.0
 """
 
-import json
 import os
-import re
-from typing import Dict, Any, List
+import json
+import logging
+from typing import Dict, Any, Tuple
 from openai import AsyncOpenAI
-from datetime import datetime
 
+logger = logging.getLogger(__name__)
 client = AsyncOpenAI(api_key=os.getenv("OPENAI_API_KEY", ""))
 
 
 class AIHandler:
-    """Handles AI conversation with troubleshooting-first approach and customer validation"""
+    """AI-powered customer service with smart state machine"""
 
-    # Conversation states - LINEAR FLOW
-    STATE_GREETING = "greeting"
-    STATE_CHECK_RESOLVED = "check_resolved"
-    STATE_COLLECT_FORM = (
-        "collect_form"  # New: Show form and collect both ID + description
-    )
-    STATE_VALIDATING_CUSTOMER = "validating_customer"  # New: Validate customer ID
-    STATE_CONFIRM_DATA = "confirm_data"
-    STATE_COMPLETED = "completed"
+    # ============ STATES ============
+    STATE_DETECT = "detect"              # Initial - waiting for topic
+    STATE_PRODUCT_INFO = "product_info"  # Answering product questions
+    STATE_TROUBLESHOOT = "troubleshoot"  # Giving troubleshooting steps
+    STATE_FORM_SENT = "form_sent"        # Form sent, waiting for form data
+    STATE_ESCALATED = "escalated"        # Escalated to human
 
-    # Troubleshooting steps based on issue type
-    TROUBLESHOOTING_STEPS = {
-        "internet_mati": [
-            "Coba restart modem dengan cara cabut kabel power, tunggu 30 detik, lalu colok lagi",
-            "Pastikan semua kabel (power, LAN, fiber) terpasang dengan baik dan tidak longgar",
-            "Cek lampu indikator di modem - normalnya lampu Power, LAN, dan Internet/PON harus menyala hijau",
-            "Jika pakai WiFi, coba sambungkan langsung pakai kabel LAN ke laptop/PC",
-        ],
-        "internet_lambat": [
-            "Coba restart modem dulu - cabut power 30 detik lalu colok lagi",
-            "Cek berapa device yang terhubung ke WiFi, mungkin terlalu banyak",
-            "Coba dekatkan device ke modem/router atau pindah ke ruangan yang lebih dekat",
-            "Pastikan tidak ada yang sedang download besar atau streaming di device lain",
-        ],
-        "wifi_bermasalah": [
-            "Restart modem dengan cabut kabel power 30 detik",
-            "Coba lupakan (forget) jaringan WiFi di HP/laptop, lalu sambungkan ulang",
-            "Pastikan jarak tidak terlalu jauh dari modem",
-            "Cek apakah pakai kabel LAN bisa konek normal (untuk isolasi masalah WiFi)",
-        ],
-        "default": [
-            "Langkah pertama, coba restart modem - cabut power 30 detik lalu colok lagi",
-            "Pastikan semua kabel terpasang dengan baik",
-            "Cek lampu indikator modem apakah normal (hijau semua)",
-        ],
+    # ============ INTENTS ============
+    INTENT_PRODUCT = "product"           # Asking about products/pricing
+    INTENT_COMPLAINT = "complaint"       # Reporting internet issues
+    INTENT_STATUS = "status"             # Asking about report status
+    INTENT_RESOLVED = "resolved"         # Saying problem is fixed
+    INTENT_NOT_RESOLVED = "not_resolved" # Saying problem persists
+    INTENT_FORM_DATA = "form_data"       # Submitting form information
+    INTENT_GREETING = "greeting"         # Hi, hello, etc
+    INTENT_THANKS = "thanks"             # Thank you, ok, etc
+    INTENT_OTHER = "other"               # Unrelated topics
+
+    # ============ STATE TRANSITIONS ============
+    # Flexible cross-state transitions allowed
+    # Core flow: DETECT → TROUBLESHOOT → FORM_SENT → ESCALATED
+    # But can switch topics anytime (except form_sent which locks until form/topic change)
+    VALID_TRANSITIONS = {
+        STATE_DETECT: [STATE_PRODUCT_INFO, STATE_TROUBLESHOOT, STATE_DETECT],
+        STATE_PRODUCT_INFO: [STATE_DETECT, STATE_TROUBLESHOOT, STATE_PRODUCT_INFO],
+        STATE_TROUBLESHOOT: [STATE_FORM_SENT, STATE_DETECT, STATE_TROUBLESHOOT, STATE_PRODUCT_INFO],
+        STATE_FORM_SENT: [STATE_ESCALATED, STATE_DETECT, STATE_FORM_SENT, STATE_PRODUCT_INFO, STATE_TROUBLESHOOT],
+        STATE_ESCALATED: [STATE_DETECT, STATE_ESCALATED, STATE_PRODUCT_INFO, STATE_TROUBLESHOOT],
     }
 
-    # Neti's personality
-    PERSONALITY = """Kamu adalah Neti, asisten virtual dari Intynet (ISP di Balikpapan).
+    # ============ KNOWLEDGE BASE ============
+    KNOWLEDGE_BASE = """
+## LAYANAN INTYNET
 
-Personality:
-- Ramah, helpful, dan empathetic
-- Bahasa Indonesia casual tapi profesional
-- Pakai emoji secukupnya (1-2 per message)
-- Responsif terhadap emosi customer
-- Variasi sapaan natural
+Intynet adalah layanan internet fiber-optic dengan:
+- ✅ Unlimited tanpa kuota & FUP
+- ✅ Kecepatan stabil sesuai paket
+- ✅ Modem + WiFi dipinjamkan GRATIS
+- ✅ TV Transvision untuk paket tertentu
+- ✅ Support 24 jam
+- 💰 Instalasi normal: Rp 150.000 (PROMO: GRATIS!)
 
-CRITICAL RULES:
-- Response SINGKAT: max 2-3 kalimat
-- LANGSUNG ke inti
-- Natural seperti chat CS manusia
-- Jangan terlalu formal"""
+## PAKET INTERNET RUMAH
+
+| Paket   | Speed    | Harga/bulan  |
+|---------|----------|--------------|
+| Starter | 10 Mbps  | Rp 149.000   |
+| Smart   | 20 Mbps  | Rp 199.000   |
+| Family  | 30 Mbps  | Rp 249.000   |
+| Maxima  | 50 Mbps  | Rp 299.000   |
+| Ultima  | 100 Mbps | Rp 380.000   |
+
+*Harga belum termasuk PPN 11% dan admin Rp 5.000*
+*Paket 30/50/100 Mbps gratis 40 channel TV Transvision!*
+
+## PAKET BISNIS
+- Bandwidth: 50–200 Mbps
+- IP privat tersedia
+- Harga konsultasi lebih lanjut
+
+## KEBIJAKAN
+- Sistem prabayar (bayar dulu baru pakai)
+- Invoice terbit tgl 1, jatuh tempo tgl 20
+- Minimal berlangganan 12 bulan
+- Pemasangan ± 1-3 hari kerja
+- Modem wajib dikembalikan jika berhenti
+- Maksimal tarikan kabel 250m
+"""
+
+    PROMO_TEXT = """
+📢 *PROMO SAAT INI:*
+
+• Bebas biaya instalasi!
+• Sistem prabayar - bayar setelah aktivasi
+• Paket 30/50/100 Mbps dapat 40 channel TV Transvision GRATIS
+• Harga belum termasuk PPN 11% dan admin Rp 5.000
+• Pemasangan ± 1-3 hari kerja jika lokasi tercover
+
+Boleh dibantu *share lokasi* kak, agar bisa kami cek apakah tercover jaringan kami 📍
+"""
+
+    TROUBLESHOOT_STEPS = """
+**Langkah Troubleshooting:**
+1. Restart modem - cabut kabel power, tunggu 30 detik, colok lagi
+2. Pastikan semua kabel (power, LAN, fiber) terpasang dengan baik
+3. Cek lampu modem:
+   - Power, LAN, PON harus hijau ✅
+   - Jika LOS merah = ada gangguan fiber
+4. Jika pakai WiFi, coba dekatkan device ke modem
+"""
+
+    COMPLAINT_FORM = """Baik kak, untuk proses penanganan lebih lanjut, mohon isi data berikut:
+
+*Copy dan lengkapi:*
+
+```
+ID Pelanggan: 
+Nama: 
+Alamat: 
+Kendala: 
+Sejak Kapan: 
+```
+
+Setelah diisi, langsung kirim ke chat ini dan tim kami akan segera menindaklanjuti 🙏"""
 
     def __init__(self):
-        self.model = "gpt-4o-mini"
-        self.conversation_history: Dict[str, List[Dict]] = {}
+        self.model = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 
-    def _get_conversation_history(self, customer_id: str) -> List[Dict]:
-        if customer_id not in self.conversation_history:
-            self.conversation_history[customer_id] = []
-        return self.conversation_history[customer_id]
+    # ============ AI INTENT CLASSIFIER ============
 
-    def _add_to_history(self, customer_id: str, role: str, content: str):
-        history = self._get_conversation_history(customer_id)
-        history.append({"role": role, "content": content})
-        if len(history) > 10:
-            self.conversation_history[customer_id] = history[-10:]
+    async def _classify_intent(self, message: str, current_state: str, context: str = "") -> str:
+        """
+        Use AI to classify user intent based on message and current state.
+        NO keyword matching - fully dynamic understanding.
+        """
+        # Build state-aware prompt
+        state_hints = {
+            self.STATE_DETECT: "User baru memulai atau topik baru.",
+            self.STATE_PRODUCT_INFO: "User sedang bertanya tentang produk.",
+            self.STATE_TROUBLESHOOT: "User baru dapat langkah troubleshooting, tunggu hasil coba.",
+            self.STATE_FORM_SENT: "User sudah diminta isi form laporan. Cek apakah mengirim data form.",
+            self.STATE_ESCALATED: "User punya laporan aktif yang sedang diproses tim."
+        }
 
-    def _detect_issue_type(self, message: str) -> str:
-        """Detect issue type from message"""
-        msg_lower = message.lower()
+        system_prompt = f"""Kamu adalah intent classifier untuk chatbot ISP.
 
-        if any(
-            word in msg_lower
-            for word in [
-                "mati",
-                "tidak bisa",
-                "gak bisa",
-                "ga bisa",
-                "no internet",
-                "putus",
-            ]
-        ):
-            return "internet_mati"
-        elif any(
-            word in msg_lower
-            for word in ["lambat", "lemot", "pelan", "slow", "lag", "lelet"]
-        ):
-            return "internet_lambat"
-        elif any(word in msg_lower for word in ["wifi", "wi-fi", "wireless", "sinyal"]):
-            return "wifi_bermasalah"
-        else:
-            return "default"
+CURRENT STATE: {current_state}
+STATE CONTEXT: {state_hints.get(current_state, '')}
+CONVERSATION CONTEXT: {context}
 
-    def _check_still_not_working(self, message: str) -> bool:
-        """Check if user says problem is not resolved"""
-        msg_lower = message.lower()
+Klasifikasikan pesan user ke SATU intent berikut:
+- "product": Tanya produk, harga, paket, instalasi, langganan, promo
+- "complaint": Lapor masalah internet (lambat, mati, putus, error, gangguan)
+- "status": Tanya status laporan/tiket/progress penanganan
+- "resolved": Bilang masalah sudah teratasi/normal/bekerja lagi
+- "not_resolved": Bilang masalah masih ada/belum beres setelah troubleshoot
+- "form_data": Mengirim data form (ada ID pelanggan, nama, alamat, kendala)
+- "greeting": Sapaan (halo, hi, selamat pagi, dll)
+- "thanks": Terima kasih, ok, baik, siap, iya, noted
+- "other": Tidak terkait layanan ISP
 
-        not_resolved_keywords = [
-            "masih",
-            "tetap",
-            "belum",
-            "tidak",
-            "gak",
-            "ga ",
-            "nggak",
-            "ngga",
-            "sama aja",
-            "sama saja",
-            "tetep",
-            "still",
-            "blm",
-            "tdk",
-        ]
+ATURAN PENTING STATE:
+1. STATE "form_sent": Jika pesan berisi ID/nama/alamat/kendala → "form_data"
+2. STATE "troubleshoot": 
+   - Respon negatif (masih bermasalah, belum, tetap, ga bisa) → "not_resolved"
+   - Respon positif (sudah normal, bisa, lancar) → "resolved"
+   - Pertanyaan baru → sesuai topik
+3. Pesan singkat "ok", "baik", "siap", "oke", "ya" → "thanks"
+4. Tanya "gimana laporan", "sudah ditangani" → "status"
 
-        resolved_keywords = [
-            "sudah",
-            "udah",
-            "bisa",
-            "berhasil",
-            "work",
-            "jalan",
-            "lancar",
-            "solved",
-            "fix",
-            "oke",
-            "ok",
-            "yes",
-            "ya",
-            "mantap",
-            "thanks",
-            "makasih",
-        ]
+PENTING: Pahami MAKSUD pesan, bukan hanya kata-kata. 
+Contoh: "wifi saya kok jadi begini ya" = complaint (bukan product)
+Contoh: "oh gitu, oke deh" = thanks (bukan resolved)
 
-        # Check if resolved first
-        for keyword in resolved_keywords:
-            if keyword in msg_lower and not any(
-                neg in msg_lower for neg in ["tidak", "gak", "ga ", "belum", "blm"]
-            ):
-                return False
-
-        # Check if not resolved
-        for keyword in not_resolved_keywords:
-            if keyword in msg_lower:
-                return True
-
-        return False
-
-    def _extract_customer_id(self, message: str) -> str:
-        """Extract customer ID from message"""
-        # Try regex patterns
-        patterns = [
-            r"[A-Za-z]\d{3,}[A-Za-z]*",  # C650AD, A123BC
-            r"\d{3,}[A-Za-z]+",  # 123ABC
-            r"[A-Za-z]{2,}\d{3,}",  # AB123
-        ]
-
-        for pattern in patterns:
-            match = re.search(pattern, message.upper())
-            if match:
-                return match.group()
-
-        return None
-
-    async def _generate_ai_response(
-        self,
-        customer_id: str,
-        instruction: str,
-        user_message: str,
-        collected_data: Dict[str, Any],
-    ) -> str:
-        """Generate AI response"""
-
-        context_parts = [self.PERSONALITY, "", instruction]
-
-        if collected_data:
-            context_parts.append("\nData terkumpul:")
-            for key, value in collected_data.items():
-                if key not in [
-                    "message_count",
-                    "troubleshooting_given",
-                    "customer_validated",
-                    "customer_data",
-                ]:
-                    context_parts.append(f"- {key}: {value}")
-
-        system_prompt = "\n".join(context_parts)
-        history = self._get_conversation_history(customer_id)
-
-        messages = (
-            [{"role": "system", "content": system_prompt}]
-            + history
-            + [{"role": "user", "content": user_message}]
-        )
+Jawab HANYA dengan satu kata intent, tidak ada penjelasan."""
 
         try:
             response = await client.chat.completions.create(
-                model=self.model, messages=messages, temperature=0.8, max_tokens=300
+                model=self.model,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": message}
+                ],
+                temperature=0.1,
+                max_tokens=20
             )
-
-            ai_response = response.choices[0].message.content.strip()
-
-            self._add_to_history(customer_id, "user", user_message)
-            self._add_to_history(customer_id, "assistant", ai_response)
-
-            return ai_response
-
+            intent = response.choices[0].message.content.strip().lower()
+            
+            # Validate intent
+            valid_intents = [
+                self.INTENT_PRODUCT, self.INTENT_COMPLAINT, self.INTENT_STATUS,
+                self.INTENT_RESOLVED, self.INTENT_NOT_RESOLVED, self.INTENT_FORM_DATA,
+                self.INTENT_GREETING, self.INTENT_THANKS, self.INTENT_OTHER
+            ]
+            
+            if intent not in valid_intents:
+                logger.warning(f"Unknown intent '{intent}', defaulting to 'other'")
+                return self.INTENT_OTHER
+            
+            logger.info(f"🎯 Intent classified: {intent} (state: {current_state})")
+            return intent
+            
         except Exception as e:
-            print(f"AI Response Error: {e}")
-            return "Maaf, ada kendala sistem sebentar. Bisa coba lagi?"
+            logger.error(f"Intent classification error: {e}")
+            return self.INTENT_OTHER
+
+    # ============ AI RESPONSE GENERATOR ============
+
+    async def _generate_response(
+        self, 
+        instruction: str, 
+        user_message: str, 
+        include_kb: bool = True,
+        conversation_context: str = ""
+    ) -> str:
+        """Generate AI response using OpenAI"""
+        system = """Kamu adalah Neti, asisten virtual Intynet (ISP fiber-optic di Balikpapan).
+
+PERSONALITY:
+- Ramah dan helpful
+- Bahasa Indonesia casual, sopan (pakai "kak")
+- Emoji secukupnya (1-2 per pesan)
+- Empathetic terhadap keluhan
+- Response singkat dan to the point (max 3 paragraf)
+
+RULES:
+- Jawab berdasarkan knowledge base
+- Jangan mengarang info yang tidak ada
+- Jika di luar knowledge base, bilang akan dibantu tim terkait"""
+
+        if include_kb:
+            system += f"\n\nKNOWLEDGE BASE:\n{self.KNOWLEDGE_BASE}"
+        
+        if conversation_context:
+            system += f"\n\nCONTEXT:\n{conversation_context}"
+            
+        system += f"\n\nINSTRUCTION:\n{instruction}"
+
+        try:
+            response = await client.chat.completions.create(
+                model=self.model,
+                messages=[
+                    {"role": "system", "content": system},
+                    {"role": "user", "content": user_message}
+                ],
+                temperature=0.7,
+                max_tokens=400
+            )
+            return response.choices[0].message.content.strip()
+        except Exception as e:
+            logger.error(f"OpenAI error: {e}")
+            return "Maaf kak, ada kendala sistem. Bisa coba lagi ya? 🙏"
+
+    # ============ STATE HANDLERS ============
+
+    async def _handle_detect(
+        self, intent: str, message: str, data: Dict[str, Any]
+    ) -> Tuple[str, str, Dict[str, Any], bool]:
+        """Handle DETECT state - route based on intent"""
+        
+        if intent == self.INTENT_PRODUCT:
+            reply = await self._generate_response(
+                """Customer menanyakan produk/harga.
+Berikan info paket dengan jelas dan singkat.
+Tanyakan apakah mau dibantu cek coverage area.""",
+                message
+            )
+            reply += "\n\n" + self.PROMO_TEXT
+            return self.STATE_PRODUCT_INFO, reply, data, False
+        
+        if intent == self.INTENT_COMPLAINT:
+            data["initial_complaint"] = message[:200]
+            reply = await self._generate_response(
+                f"""Customer melaporkan gangguan internet.
+Tunjukkan empati singkat, lalu berikan langkah troubleshooting:
+
+{self.TROUBLESHOOT_STEPS}
+
+Akhiri dengan tanya "Mau dicoba dulu langkah-langkahnya kak?" """,
+                message,
+                include_kb=False
+            )
+            return self.STATE_TROUBLESHOOT, reply, data, False
+        
+        if intent == self.INTENT_GREETING:
+            reply = await self._generate_response(
+                "Customer menyapa. Balas ramah, perkenalkan diri sebagai Neti dari Intynet, tanya ada yang bisa dibantu.",
+                message,
+                include_kb=False
+            )
+            return self.STATE_DETECT, reply, data, False
+        
+        if intent == self.INTENT_THANKS:
+            return self.STATE_DETECT, "Siap kak! Ada yang bisa dibantu lagi? 😊", data, False
+        
+        # Default - general inquiry
+        reply = await self._generate_response(
+            "Jawab pertanyaan customer. Jika di luar knowledge base, bilang akan dibantu tim terkait.",
+            message
+        )
+        return self.STATE_DETECT, reply, data, False
+
+    async def _handle_product_info(
+        self, intent: str, message: str, data: Dict[str, Any]
+    ) -> Tuple[str, str, Dict[str, Any], bool]:
+        """Handle PRODUCT_INFO state"""
+        
+        if intent == self.INTENT_COMPLAINT:
+            # Switch to complaint handling
+            data["initial_complaint"] = message[:200]
+            reply = await self._generate_response(
+                f"""Customer melaporkan gangguan. Berikan troubleshooting:
+{self.TROUBLESHOOT_STEPS}
+Tanya mau dicoba dulu?""",
+                message,
+                include_kb=False
+            )
+            return self.STATE_TROUBLESHOOT, reply, data, False
+        
+        if intent == self.INTENT_THANKS:
+            return self.STATE_DETECT, "Siap kak! Jika ada pertanyaan lain, silakan tanya ya 😊", data, False
+        
+        # Continue answering product questions
+        reply = await self._generate_response(
+            "Lanjutkan menjawab pertanyaan produk/harga. Tetap helpful dan informatif.",
+            message
+        )
+        return self.STATE_PRODUCT_INFO, reply, data, False
+
+    async def _handle_troubleshoot(
+        self, intent: str, message: str, data: Dict[str, Any]
+    ) -> Tuple[str, str, Dict[str, Any], bool]:
+        """Handle TROUBLESHOOT state - waiting for troubleshoot result"""
+        
+        if intent == self.INTENT_NOT_RESOLVED:
+            # Problem not resolved - send form (LOCKED: must go to form_sent)
+            return self.STATE_FORM_SENT, self.COMPLAINT_FORM, data, False
+        
+        if intent == self.INTENT_RESOLVED:
+            reply = "Alhamdulillah sudah normal ya kak! 🎉 Senang bisa membantu. Jika ada kendala lagi, silakan hubungi kami kapan saja 😊"
+            return self.STATE_DETECT, reply, data, False
+        
+        if intent == self.INTENT_PRODUCT:
+            # Switch topic to product
+            reply = await self._generate_response(
+                "Customer tanya produk. Jawab pertanyaannya.",
+                message
+            )
+            reply += "\n\n" + self.PROMO_TEXT
+            return self.STATE_PRODUCT_INFO, reply, data, False
+        
+        if intent == self.INTENT_THANKS:
+            # Acknowledge but stay in troubleshoot
+            reply = "Siap kak! Coba dulu langkah-langkahnya ya. Kabari kalau sudah dicoba 😊"
+            return self.STATE_TROUBLESHOOT, reply, data, False
+        
+        if intent == self.INTENT_COMPLAINT:
+            # Additional complaint details
+            reply = await self._generate_response(
+                f"""Customer memberikan detail tambahan masalah.
+Berikan troubleshooting yang relevan:
+{self.TROUBLESHOOT_STEPS}
+Tanya apakah mau dicoba.""",
+                message,
+                include_kb=False,
+                conversation_context=f"Keluhan awal: {data.get('initial_complaint', '')}"
+            )
+            return self.STATE_TROUBLESHOOT, reply, data, False
+        
+        # Unclear response - ask for clarification (stay in troubleshoot)
+        reply = "Bagaimana kak, sudah dicoba langkah-langkahnya? Apakah sudah normal atau masih bermasalah? 🙏"
+        return self.STATE_TROUBLESHOOT, reply, data, False
+
+    async def _handle_form_sent(
+        self, intent: str, message: str, data: Dict[str, Any]
+    ) -> Tuple[str, str, Dict[str, Any], bool]:
+        """Handle FORM_SENT state - waiting for form submission (LOCKED)"""
+        
+        if intent == self.INTENT_FORM_DATA:
+            # Form received - ESCALATE (human takeover)
+            data["has_pending_report"] = True
+            data["form_submitted"] = message[:500]
+            logger.info("📋 Form received - escalating to human")
+            return self.STATE_ESCALATED, None, data, True  # ai_stop = True
+        
+        if intent == self.INTENT_PRODUCT:
+            # Allow product questions but remind about form
+            reply = await self._generate_response(
+                "Customer tanya produk. Jawab pertanyaannya, tapi ingatkan soal form laporan.",
+                message
+            )
+            reply += "\n\n_PS: Jangan lupa isi form laporan di atas ya kak jika ingin dilanjutkan penanganannya 🙏_"
+            return self.STATE_FORM_SENT, reply, data, False
+        
+        if intent == self.INTENT_THANKS:
+            return self.STATE_FORM_SENT, "Siap kak! Ditunggu form-nya ya 🙏", data, False
+        
+        # Stay locked - remind about form
+        return self.STATE_FORM_SENT, "Mohon isi form di atas ya kak agar bisa kami proses 🙏\n\nAtau jika ada pertanyaan lain, silakan tanyakan saja!", data, False
+
+    async def _handle_escalated(
+        self, intent: str, message: str, data: Dict[str, Any]
+    ) -> Tuple[str, str, Dict[str, Any], bool]:
+        """Handle ESCALATED state - human handling, AI helps with other topics"""
+        
+        if intent == self.INTENT_STATUS:
+            reply = "Laporan kakak sudah diterima dan sedang dalam proses penanganan 🔧\n\nTim kami akan segera menghubungi. Ada hal lain yang bisa dibantu?"
+            return self.STATE_ESCALATED, reply, data, False
+        
+        if intent == self.INTENT_COMPLAINT:
+            reply = "Untuk laporan sebelumnya masih dalam proses kak 🔧\n\nJika ini masalah berbeda atau ada info tambahan, silakan sampaikan."
+            return self.STATE_ESCALATED, reply, data, False
+        
+        if intent == self.INTENT_PRODUCT:
+            # Can still answer product questions
+            reply = await self._generate_response(
+                "Customer tanya produk. Jawab pertanyaannya.",
+                message
+            )
+            reply += "\n\n" + self.PROMO_TEXT
+            return self.STATE_ESCALATED, reply, data, False
+        
+        if intent == self.INTENT_THANKS:
+            return self.STATE_ESCALATED, "Sama-sama kak! Ada yang bisa dibantu lagi? 😊", data, False
+        
+        # Other questions - answer normally
+        reply = await self._generate_response(
+            "Jawab pertanyaan customer. Tetap ramah.",
+            message
+        )
+        return self.STATE_ESCALATED, reply, data, False
+
+    # ============ MAIN PROCESS ============
 
     async def process_message(
         self,
@@ -234,509 +448,61 @@ CRITICAL RULES:
         message: str,
         session: Dict[str, Any],
     ) -> Dict[str, Any]:
-        """Process message and route to appropriate handler"""
-
-        current_state = session.get("state", self.STATE_GREETING)
-        collected_data = session.get("collected_data", {})
-        message_count = session.get("message_count", 0) + 1
-
+        """
+        Process incoming message using AI-based intent detection.
+        NO keyword matching - fully dynamic.
+        
+        Returns:
+            {
+                "reply": str or None (None = no reply),
+                "session": updated session dict,
+                "ai_stop": bool (True = don't send message, human takeover)
+            }
+        """
+        state = session.get("state", self.STATE_DETECT)
+        data = session.get("collected_data", {})
+        
         # Store customer info
-        if customer_name and "customer_name" not in collected_data:
-            collected_data["customer_name"] = customer_name
-        if customer_id and "phone" not in collected_data:
-            collected_data["phone"] = customer_id
+        if customer_name:
+            data["customer_name"] = customer_name
+        if customer_id:
+            data["phone"] = customer_id
 
-        # Route to handler based on state
-        if current_state == self.STATE_GREETING:
-            result = await self._handle_greeting(customer_id, message, collected_data)
-        elif current_state == self.STATE_CHECK_RESOLVED:
-            result = await self._handle_check_resolved(
-                customer_id, message, collected_data
-            )
-        elif current_state == self.STATE_COLLECT_FORM:
-            result = await self._handle_collect_form(
-                customer_id, message, collected_data
-            )
-        elif current_state == self.STATE_VALIDATING_CUSTOMER:
-            result = await self._handle_validating_customer(
-                customer_id, message, collected_data
-            )
-        elif current_state == self.STATE_CONFIRM_DATA:
-            result = await self._handle_confirmation(
-                customer_id, message, collected_data
-            )
-        elif current_state == self.STATE_COMPLETED:
-            result = await self._handle_completed(customer_id, message, collected_data)
-        else:
-            result = await self._handle_greeting(customer_id, message, {})
+        # Build context for intent classification
+        context_parts = []
+        if data.get("initial_complaint"):
+            context_parts.append(f"Keluhan awal: {data['initial_complaint'][:50]}")
+        if data.get("has_pending_report"):
+            context_parts.append("Ada laporan pending")
+        context = ", ".join(context_parts) if context_parts else ""
 
-        # Add message count to session
-        result["session"]["message_count"] = message_count
+        logger.info(f"📥 Processing: state={state}, msg='{message[:30]}...'")
 
-        return result
+        # ===== AI-BASED INTENT CLASSIFICATION =====
+        intent = await self._classify_intent(message, state, context)
 
-    async def _handle_greeting(
-        self, customer_id: str, message: str, collected_data: Dict[str, Any]
-    ) -> Dict[str, Any]:
-        """Handle greeting and detect issue"""
+        # ===== ROUTE TO STATE HANDLER =====
+        handlers = {
+            self.STATE_DETECT: self._handle_detect,
+            self.STATE_PRODUCT_INFO: self._handle_product_info,
+            self.STATE_TROUBLESHOOT: self._handle_troubleshoot,
+            self.STATE_FORM_SENT: self._handle_form_sent,
+            self.STATE_ESCALATED: self._handle_escalated,
+        }
 
-        # Detect if message contains issue
-        detection_prompt = f"""Analisis pesan ini: "{message}"
+        handler = handlers.get(state, self._handle_detect)
+        new_state, reply, new_data, ai_stop = await handler(intent, message, data)
 
-Apakah ada keluhan/masalah internet? Jawab dalam JSON:
-{{"has_issue": true/false, "issue_summary": "ringkasan singkat atau null"}}"""
+        # ===== VALIDATE STATE TRANSITION =====
+        valid_next = self.VALID_TRANSITIONS.get(state, [])
+        if new_state not in valid_next:
+            logger.warning(f"⚠️ Invalid transition {state} → {new_state}, staying in {state}")
+            new_state = state
 
-        try:
-            resp = await client.chat.completions.create(
-                model=self.model,
-                messages=[{"role": "user", "content": detection_prompt}],
-                temperature=0.3,
-                response_format={"type": "json_object"},
-            )
-
-            result = json.loads(resp.choices[0].message.content.strip())
-
-            if result.get("has_issue"):
-                collected_data["initial_complaint"] = result.get(
-                    "issue_summary", message
-                )
-                issue_type = self._detect_issue_type(message)
-                collected_data["issue_type"] = issue_type
-
-                # Get troubleshooting steps
-                steps = self.TROUBLESHOOTING_STEPS.get(
-                    issue_type, self.TROUBLESHOOTING_STEPS["default"]
-                )
-                steps_text = "\n".join([f"• {step}" for step in steps])
-
-                instruction = f"""Customer melaporkan: {result.get('issue_summary', message)}
-
-Task: Tunjukkan empati singkat, lalu berikan langkah troubleshooting ini:
-{steps_text}
-
-Setelah itu tanya apakah mau dicoba dulu dan kabari hasilnya.
-Gunakan format bullet points. Max 4-5 kalimat total."""
-
-                reply = await self._generate_ai_response(
-                    customer_id, instruction, message, collected_data
-                )
-                collected_data["troubleshooting_given"] = True
-                next_state = self.STATE_CHECK_RESOLVED
-            else:
-                instruction = "Sapa sebagai Neti dari Intynet. Tanya ada yang bisa dibantu. Max 2 kalimat."
-                reply = await self._generate_ai_response(
-                    customer_id, instruction, message, collected_data
-                )
-                next_state = self.STATE_GREETING
-
-        except Exception as e:
-            print(f"Greeting error: {e}")
-            instruction = "Sapa sebagai Neti dari Intynet. Tanya ada yang bisa dibantu."
-            reply = await self._generate_ai_response(
-                customer_id, instruction, message, collected_data
-            )
-            next_state = self.STATE_GREETING
+        logger.info(f"📤 Result: state={new_state}, ai_stop={ai_stop}")
 
         return {
             "reply": reply,
-            "session": {"state": next_state, "collected_data": collected_data},
-        }
-
-    async def _handle_check_resolved(
-        self, customer_id: str, message: str, collected_data: Dict[str, Any]
-    ) -> Dict[str, Any]:
-        """Check if issue is resolved after troubleshooting"""
-
-        # Use AI to detect
-        check_prompt = f"""Analisis response user: "{message}"
-
-Apakah masalah SUDAH TERATASI atau MASIH BERMASALAH?
-JSON: {{"resolved": true/false}}
-
-resolved=true jika: sudah bisa, berhasil, lancar, ok, thanks, makasih
-resolved=false jika: masih, tetap, belum, tidak bisa, sama aja, gagal"""
-
-        try:
-            resp = await client.chat.completions.create(
-                model=self.model,
-                messages=[{"role": "user", "content": check_prompt}],
-                temperature=0.2,
-                response_format={"type": "json_object"},
-            )
-
-            result = json.loads(resp.choices[0].message.content.strip())
-            is_resolved = result.get("resolved", False)
-
-        except Exception as e:
-            print(f"Check resolved error: {e}")
-            is_resolved = not self._check_still_not_working(message)
-
-        if is_resolved:
-            # Problem solved!
-            instruction = """Senang masalahnya sudah teratasi! 
-Ucapkan terima kasih sudah menghubungi Intynet.
-Bilang kalau ada masalah lagi bisa hubungi kapan saja.
-Max 2 kalimat."""
-
-            reply = await self._generate_ai_response(
-                customer_id, instruction, message, collected_data
-            )
-            next_state = self.STATE_COMPLETED
-            collected_data["resolved_by_troubleshooting"] = True
-        else:
-            # Need to create report - Show FORM (copy-paste ready)
-            form_text = """Baik, saya akan bantu buatkan laporan ke tim teknis kami. 📝
-
-Mohon *copy-paste* format di bawah ini, lalu isi datanya:
-
-ID: 
-Gangguan: 
-
-Contoh pengisian:
-ID: C650AD
-Gangguan: Internet mati sejak pagi, lampu modem merah berkedip"""
-
-            reply = form_text
-            next_state = self.STATE_COLLECT_FORM
-
-        return {
-            "reply": reply,
-            "session": {"state": next_state, "collected_data": collected_data},
-        }
-
-    async def _handle_collect_form(
-        self, customer_id: str, message: str, collected_data: Dict[str, Any]
-    ) -> Dict[str, Any]:
-        """Handle form submission - extract ID and description"""
-
-        # Try to extract ID and description from message
-        extracted_id = None
-        extracted_desc = None
-
-        # Check for formatted response (ID: xxx, Gangguan: xxx)
-        id_match = re.search(r"(?:ID|id|Id)[:\s]*([A-Za-z0-9]+)", message)
-        desc_match = re.search(
-            r"(?:Gangguan|gangguan|GANGGUAN|Detail|detail|Masalah|masalah)[:\s]*(.+)",
-            message,
-            re.IGNORECASE | re.DOTALL,
-        )
-
-        if id_match:
-            extracted_id = id_match.group(1).upper()
-
-        if desc_match:
-            extracted_desc = desc_match.group(1).strip()
-
-        # If not formatted, try to extract customer ID from anywhere in message
-        if not extracted_id:
-            extracted_id = self._extract_customer_id(message)
-
-        # If still no description, use the whole message minus the ID part
-        if not extracted_desc and extracted_id:
-            # Remove ID part and use rest as description
-            desc_text = re.sub(r"(?:ID|id|Id)[:\s]*[A-Za-z0-9]+[,\s]*", "", message)
-            desc_text = desc_text.strip()
-            if len(desc_text) > 10:
-                extracted_desc = desc_text
-
-        # Validate we have both
-        if not extracted_id:
-            reply = """Hmm, saya tidak menemukan ID Pelanggan di pesanmu 🤔
-
-Coba *copy-paste* format ini ya:
-
-ID: 
-Gangguan: 
-
-*(ID bisa dilihat di tagihan/kontrak, contoh: C650AD)*"""
-
-            return {
-                "reply": reply,
-                "session": {
-                    "state": self.STATE_COLLECT_FORM,
-                    "collected_data": collected_data,
-                },
-            }
-
-        if not extracted_desc or len(extracted_desc) < 5:
-            reply = f"""✅ ID Pelanggan: *{extracted_id}*
-
-Tapi detail gangguannya belum ada. Balas dengan:
-
-Gangguan: [jelaskan masalahnya, sejak kapan]"""
-
-            collected_data["customer_references_number"] = extracted_id
-
-            return {
-                "reply": reply,
-                "session": {
-                    "state": self.STATE_COLLECT_FORM,
-                    "collected_data": collected_data,
-                },
-            }
-
-        # Both ID and description found - store and request validation
-        collected_data["customer_references_number"] = extracted_id
-        collected_data["description"] = extracted_desc
-        collected_data["problem_time"] = datetime.now().isoformat()
-
-        # Return with validation request
-        return {
-            "reply": f"⏳ Sedang memverifikasi ID Pelanggan {extracted_id}...",
-            "session": {
-                "state": self.STATE_VALIDATING_CUSTOMER,
-                "collected_data": collected_data,
-            },
-            "needs_validation": True,
-            "customer_ref_id": extracted_id,
-        }
-
-    async def _handle_validating_customer(
-        self, customer_id: str, message: str, collected_data: Dict[str, Any]
-    ) -> Dict[str, Any]:
-        """Handle after customer validation"""
-
-        # This state is entered after main.py validates the customer
-        # Check if we have validation result in collected_data
-
-        if collected_data.get("customer_validated") == True:
-            # Customer is valid - show confirmation
-            customer_data = collected_data.get("customer_data", {})
-            customer_name_from_system = customer_data.get(
-                "name", collected_data.get("customer_name", "-")
-            )
-
-            summary = f"""📋 *Ringkasan Laporan*
-
-👤 Nama: {customer_name_from_system}
-📱 No. HP: {collected_data.get('phone', '-')}
-🆔 ID Pelanggan: {collected_data.get('customer_references_number', '-')}
-❗ Keluhan Awal: {collected_data.get('initial_complaint', '-')}
-📝 Detail: {collected_data.get('description', '-')}
-
-Apakah data di atas sudah benar? Balas *Ya* untuk kirim atau *Tidak* untuk koreksi."""
-
-            # Update customer name from system
-            if customer_name_from_system:
-                collected_data["customer_name"] = customer_name_from_system
-
-            return {
-                "reply": summary,
-                "session": {
-                    "state": self.STATE_CONFIRM_DATA,
-                    "collected_data": collected_data,
-                },
-            }
-
-        elif collected_data.get("customer_validated") == False:
-            # Customer not found - ask for valid ID
-            reply = """❌ Maaf, ID Pelanggan tidak ditemukan di sistem kami.
-
-Pastikan ID yang dimasukkan benar. ID Pelanggan bisa dilihat di:
-• Tagihan/invoice bulanan
-• Kontrak berlangganan
-• Email konfirmasi pendaftaran
-
-Mohon masukkan ID Pelanggan yang valid:"""
-
-            # Clear the invalid ID
-            collected_data.pop("customer_references_number", None)
-            collected_data.pop("customer_validated", None)
-
-            return {
-                "reply": reply,
-                "session": {
-                    "state": self.STATE_COLLECT_FORM,
-                    "collected_data": collected_data,
-                },
-            }
-
-        else:
-            # No validation result yet - this shouldn't happen normally
-            # Try to extract ID from current message and request validation again
-            extracted_id = self._extract_customer_id(message)
-
-            if extracted_id:
-                collected_data["customer_references_number"] = extracted_id
-                return {
-                    "reply": f"⏳ Sedang memverifikasi ID Pelanggan {extracted_id}...",
-                    "session": {
-                        "state": self.STATE_VALIDATING_CUSTOMER,
-                        "collected_data": collected_data,
-                    },
-                    "needs_validation": True,
-                    "customer_ref_id": extracted_id,
-                }
-            else:
-                reply = """Mohon masukkan ID Pelanggan Anda:
-(contoh: C650AD - bisa dilihat di tagihan)"""
-
-                return {
-                    "reply": reply,
-                    "session": {
-                        "state": self.STATE_COLLECT_FORM,
-                        "collected_data": collected_data,
-                    },
-                }
-
-    async def _handle_confirmation(
-        self, customer_id: str, message: str, collected_data: Dict[str, Any]
-    ) -> Dict[str, Any]:
-        """Handle data confirmation"""
-
-        msg_lower = message.lower().strip()
-
-        yes_keywords = [
-            "ya",
-            "yes",
-            "benar",
-            "betul",
-            "ok",
-            "oke",
-            "y",
-            "yap",
-            "yup",
-            "iya",
-            "yoi",
-            "sip",
-            "siap",
-            "bener",
-        ]
-        no_keywords = [
-            "tidak",
-            "no",
-            "salah",
-            "bukan",
-            "koreksi",
-            "ubah",
-            "ganti",
-            "n",
-            "nggak",
-            "ngga",
-            "ga",
-        ]
-
-        is_yes = any(keyword in msg_lower for keyword in yes_keywords)
-        is_no = any(keyword in msg_lower for keyword in no_keywords)
-
-        if is_yes and not is_no:
-            # Create report
-            report_data = self._prepare_report_data(collected_data, customer_id)
-
-            reply = """✅ Laporan berhasil dikirim!
-
-Tim Helpdesk kami akan segera mengecek dan menghubungi Anda jika diperlukan.
-
-Terima kasih sudah melapor ke Intynet! 🙏"""
-
-            return {
-                "reply": reply,
-                "session": {
-                    "state": self.STATE_COMPLETED,
-                    "collected_data": collected_data,
-                },
-                "report_created": True,
-                "report_data": report_data,
-            }
-
-        elif is_no:
-            reply = """Baik, silakan isi ulang dengan format:
-• *ID Pelanggan*: (contoh: C650AD)
-• *Detail Gangguan*: (jelaskan masalahnya)"""
-
-            # Clear form data but keep basic info
-            keep_keys = [
-                "customer_name",
-                "phone",
-                "initial_complaint",
-                "issue_type",
-                "troubleshooting_given",
-            ]
-            collected_data = {k: v for k, v in collected_data.items() if k in keep_keys}
-
-            return {
-                "reply": reply,
-                "session": {
-                    "state": self.STATE_COLLECT_FORM,
-                    "collected_data": collected_data,
-                },
-            }
-
-        else:
-            reply = "Mohon balas *Ya* jika data sudah benar, atau *Tidak* jika ingin koreksi."
-
-            return {
-                "reply": reply,
-                "session": {
-                    "state": self.STATE_CONFIRM_DATA,
-                    "collected_data": collected_data,
-                },
-            }
-
-    async def _handle_completed(
-        self, customer_id: str, message: str, collected_data: Dict[str, Any]
-    ) -> Dict[str, Any]:
-        """Handle messages after completion"""
-
-        # Check if new issue
-        detection_prompt = f"""Analisis: "{message}"
-Ada keluhan/masalah BARU? JSON: {{"new_issue": true/false}}"""
-
-        try:
-            resp = await client.chat.completions.create(
-                model=self.model,
-                messages=[{"role": "user", "content": detection_prompt}],
-                temperature=0.2,
-                response_format={"type": "json_object"},
-            )
-
-            result = json.loads(resp.choices[0].message.content.strip())
-
-            if result.get("new_issue"):
-                # Reset for new issue
-                return await self._handle_greeting(
-                    customer_id,
-                    message,
-                    {
-                        "customer_name": collected_data.get("customer_name"),
-                        "phone": collected_data.get("phone"),
-                    },
-                )
-        except:
-            pass
-
-        reply = "Ada yang bisa saya bantu lagi? Kalau ada masalah lain, silakan ceritakan ya 😊"
-
-        return {
-            "reply": reply,
-            "session": {
-                "state": self.STATE_COMPLETED,
-                "collected_data": collected_data,
-            },
-        }
-
-    def _prepare_report_data(
-        self, collected_data: Dict[str, Any], customer_id: str
-    ) -> Dict[str, Any]:
-        """Prepare data for incoming report API"""
-
-        # Combine initial complaint and description
-        full_description = collected_data.get("description", "")
-        if collected_data.get("initial_complaint"):
-            full_description = f"Keluhan awal: {collected_data.get('initial_complaint')}\n\nDetail: {full_description}"
-
-        # Get customer ID from validated data if available
-        customer_data = collected_data.get("customer_data", {})
-
-        return {
-            "customer_id": customer_data.get("id"),  # ID from ticketing system
-            "customer_site_id": customer_data.get("site_id"),
-            "customer_name": collected_data.get("customer_name", "Unknown"),
-            "customer_phone": collected_data.get("phone", customer_id),
-            "customer_references_number": collected_data.get(
-                "customer_references_number"
-            ),
-            "description": full_description,
-            "problem_time": collected_data.get("problem_time"),
-            "qiscus_session_id": customer_id,
+            "session": {"state": new_state, "collected_data": new_data},
+            "ai_stop": ai_stop
         }
